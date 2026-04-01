@@ -6,6 +6,74 @@ Works with **Claude Code CLI** and **VS Code Copilot Chat** from the same `.clau
 
 ---
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        User (Claude Code / VS Code Copilot)         │
+│                                                                      │
+│   "greet Guna"  /  "tell me a joke"  /  "ask what is jaeger?"      │
+│   "/health-check"  /  "health check the system"                     │
+└────────────────────────────┬────────────────────────────────────────┘
+                             │  trigger phrase / slash command
+                             ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     .claude/skills/<name>/SKILL.md                  │
+│                                                                      │
+│   • Discovered automatically by Claude Code and VS Code Copilot     │
+│   • Contains: description, argument-hint, run instructions          │
+│   • Claude reads SKILL.md and follows the steps inside              │
+└──────┬──────────────────────────────┬───────────────────────────────┘
+       │                              │
+       ▼                              ▼
+┌─────────────────┐        ┌──────────────────────────┐
+│   index.py      │        │   Direct curl POST        │
+│  (greet, joke,  │        │   (health-check skill)    │
+│   ask skills)   │        │                           │
+│                 │        │  5 spans per run:         │
+│  Runs skill     │        │  • health-check.start     │
+│  logic, returns │        │  • health-check.cpu       │
+│  JSON output    │        │  • health-check.memory    │
+└──────┬──────────┘        │  • health-check.disk      │
+       │                   │  • health-check.summary   │
+       ▼                   └────────────┬──────────────┘
+┌─────────────────────────┐            │
+│   hooks/                │            │  curl POST
+│                         │            │  /v1/traces
+│  otel_skill_tracer.py   │            │
+│  (greet, joke)          │            │
+│  → OTLP gRPC :4317      │            │
+│                         │            │
+│  send_span.py           │            │
+│  (ask)                  │            │
+│  → OTLP HTTP :4318      │            │
+└──────────┬──────────────┘            │
+           │                           │
+           └──────────┬────────────────┘
+                      │  OTLP (gRPC or HTTP)
+                      ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Jaeger  (docker compose)                        │
+│                                                                      │
+│   UI  →  http://localhost:16686                                      │
+│   OTLP gRPC  →  :4317   (OTel SDK)                                  │
+│   OTLP HTTP  →  :4318   (send_span.py + health-check curl)          │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Skills
+
+| Skill | Trigger | Telemetry approach | Spans |
+|---|---|---|---|
+| `greet` | "greet Guna", "hello Alice" | OTel SDK (`otel_skill_tracer.py`) → gRPC | 2 (parent + child) |
+| `joke`  | "tell me a joke", "make me laugh" | OTel SDK (`otel_skill_tracer.py`) → gRPC | 2 (parent + child) |
+| `ask`   | "ask what is jaeger?", "what is a span?" | Stdlib HTTP (`send_span.py`) → HTTP | 1 |
+| `health-check` | "/health-check", "health check the system" | Direct `curl` POST → HTTP | 5 (one per step) |
+
+---
+
 ## Setup
 
 ```bash
@@ -26,18 +94,6 @@ Open **http://localhost:16686** → service **`claude-skills`** → Search.
 
 ---
 
-## Skills
-
-| Skill | Trigger | Slash command (Copilot) | Telemetry approach |
-|---|---|---|---|
-| `greet` | "greet Guna", "hello Alice" | `/greet Guna` | OTel SDK (`otel_skill_tracer.py`) |
-| `joke`  | "tell me a joke", "make me laugh" | `/joke` | OTel SDK (`otel_skill_tracer.py`) |
-| `ask`   | "ask what is jaeger?", "what is a span?" | `/ask what is python?` | Stdlib HTTP (`send_span.py`) |
-
-All skills live in `.claude/skills/` — this single folder is read by both Claude Code and VS Code Copilot (open standard defined at agentskills.io).
-
----
-
 ## Invoking skills
 
 ### Claude Code CLI
@@ -46,8 +102,8 @@ cd telemetry-otel-jaeger-python
 claude
 # type: greet Guna
 # type: ask what is opentelemetry?
+# type: /health-check
 ```
-Claude reads `SKILL.md`, follows the run instruction, executes `index.py`, and a span is exported.
 
 ### VS Code Copilot Chat
 
@@ -76,45 +132,18 @@ Claude reads `SKILL.md`, follows the run instruction, executes `index.py`, and a
 
 3. Open Copilot Chat — press `Ctrl+Alt+I` (Mac: `Cmd+Alt+I`) or click the Copilot icon in the sidebar.
 
-4. Make sure the chat mode is set to **Agent** (not Ask or Edit) using the dropdown at the top of the chat panel.
+4. Make sure the chat mode is set to **Agent** (not Ask or Edit).
 
 5. Use a slash command or natural language:
    ```
    /greet Guna
    /joke
    /ask what is opentelemetry?
-   greet Guna
-   tell me a joke
-   ask what is a span?
+   /health-check
+   health check the system
    ```
 
-6. Copilot reads the matching `SKILL.md`, follows the run instruction, and executes the skill:
-   ```bash
-   # greet
-   python3 .claude/skills/greet/index.py --name Guna --triggered-by claude
-
-   # ask (2-step: run skill then send telemetry)
-   python3 .claude/skills/ask/index.py --question "what is jaeger?" --triggered-by claude | tail -1
-   python3 hooks/send_span.py --skill ask --input "..." --skill-output '...' --triggered-by claude --status ok
-   ```
-
-7. The skill prints its output and a span is exported to Jaeger automatically.
-
-**Verify traces**
-
-Open http://localhost:16686 → service `claude-skills` → Search.  
-If Jaeger is not running, check `telemetry_spans.json` and run:
-```bash
-python view_spans.py --skill ask
-```
-
-### Direct CLI (debugging / CI)
-```bash
-python .claude/skills/greet/index.py --name Guna --triggered-by cli
-python .claude/skills/joke/index.py --triggered-by cli
-python .claude/skills/ask/index.py --question "what is jaeger?" --triggered-by cli
-```
-Output is JSON: `{"skill": "ask", "message": "...", "answer_source": "knowledge_base", ...}`.
+6. Open **http://localhost:16686** → service `claude-skills` → Search to view traces.
 
 ---
 
@@ -125,98 +154,97 @@ Uses `hooks/otel_skill_tracer.py` with the OpenTelemetry Python SDK.
 Spans are exported via **OTLP gRPC** (port 4317). Parent/child linking is automatic.
 
 ```
-skill.greet          ← parent span
-  └── skill.read.greet   ← child span (SKILL.md read)
+skill.greet              ← parent span
+  └── skill.read.greet  ← child span (SKILL.md read)
 ```
 
 ### Approach 2 — Stdlib HTTP (`ask`)
-Uses `hooks/send_span.py` — **no OTel SDK required**, pure Python stdlib.  
-Spans are exported via **OTLP HTTP** (port 4318) using `urllib`.  
-SKILL.md instructs the agent to run the skill then call `send_span.py` with the captured output.
+Uses `hooks/send_span.py` — no OTel SDK required, pure Python stdlib.  
+Spans are exported via **OTLP HTTP** (port 4318) using `urllib`.
 
 ```
 Step 1: python3 .claude/skills/ask/index.py --question "..."   → JSON output
 Step 2: python3 hooks/send_span.py --skill-output '<json>'     → span to Jaeger
 ```
 
+### Approach 3 — Direct curl (`health-check`)
+No Python SDK or helper script — SKILL.md instructs Claude to POST directly to Jaeger using `curl`.  
+All 5 spans share the same `traceId` so they appear as one linked trace.
+
+```
+/health-check
+  curl POST → health-check.start    (skill.input = user prompt)
+  curl POST → health-check.cpu      (system.cpu_usage)
+  curl POST → health-check.memory   (system.memory_free_pages)
+  curl POST → health-check.disk     (system.disk_used_percent)
+  curl POST → health-check.summary  (skill.input + skill.llm_response)
+```
+
+OS detection is built in — macOS/Linux uses `bash` + `awk`, Windows uses `PowerShell` + `Get-WmiObject`.
+
 ---
 
 ## Span attributes
 
-### OTel SDK spans (`greet`, `joke`) — `trace_skill`
+### OTel SDK spans (`greet`, `joke`)
 
-| Attribute | Example value | Notes |
-|---|---|---|
-| `skill.name` | `"greet"` | always |
-| `skill.file_path` | `".claude/skills/greet/SKILL.md"` | always |
-| `skill.triggered_by` | `"claude"` | always |
-| `skill.session_id` | `"8e38203a-..."` | UUID per process |
-| `skill.input` | `{"name": "Guna"}` | JSON string of arguments |
-| `skill.status` | `"ok"` / `"error"` | always |
-| `skill.duration_ms` | `3.14` | always |
-| `skill.response` | `"{'skill': 'greet', ...}"` | first 1024 chars of return value |
-| `skill.llm_response` | `"Hello, Guna! ..."` | `message` field from result dict |
-| `skill.error` | `"SKILL.md not found"` | only on exception |
-
-### OTel SDK spans (`greet`, `joke`) — `trace_skill_read`
-
-| Attribute | Example value | Notes |
-|---|---|---|
-| `skill.name` | `"greet"` | always |
-| `skill.file_path` | `".claude/skills/greet/SKILL.md"` | always |
-| `skill.session_id` | `"8e38203a-..."` | same UUID as execution span |
-| `skill.event` | `"read"` | always |
-| `skill.triggered` | `true` / `false` | did the agent decide to use this skill? |
-| `skill.query` | `"greet Guna"` | only if non-empty |
-
-### Stdlib HTTP spans (`ask`) — `send_span.py`
-
-| Attribute | Example value | Notes |
-|---|---|---|
-| `skill.name` | `"ask"` | always |
-| `skill.file_path` | `".claude/skills/ask/SKILL.md"` | always |
-| `skill.triggered_by` | `"claude"` | always |
-| `skill.session_id` | `"4a385a5f-..."` | persisted in `/tmp` across calls |
-| `skill.input` | `"what is jaeger?"` | user's original prompt |
-| `skill.llm_response` | `"Jaeger is an open-source..."` | full answer from skill |
-| `skill.answer_source` | `"knowledge_base"` / `"fallback"` | whether topic was found |
-| `skill.question_matched` | `"jaeger"` | matched keyword from Q&A dict |
-| `skill.model` | `"rule-based"` | skill type identifier |
-| `skill.duration_ms` | `0.007` | real measured execution time |
-| `skill.status` | `"ok"` / `"error"` | always |
-| `skill.error` | `"..."` | only on failure |
-
-### Process section (Jaeger) — `send_span.py`
-
-| Field | Example value |
+| Attribute | Example |
 |---|---|
-| `service.name` | `"claude-skills"` |
-| `service.version` | `"1.0.0"` |
-| `host.name` | `"my-macbook.local"` |
-| `process.pid` | `"48053"` |
-| `telemetry.sdk.name` | `"send_span.py"` |
-| `telemetry.sdk.language` | `"python"` |
+| `skill.name` | `"greet"` |
+| `skill.triggered_by` | `"claude"` |
+| `skill.session_id` | `"8e38203a-..."` |
+| `skill.input` | `{"name": "Guna"}` |
+| `skill.status` | `"ok"` / `"error"` |
+| `skill.llm_response` | `"Hello, Guna! ..."` |
+
+### Stdlib HTTP spans (`ask`)
+
+| Attribute | Example |
+|---|---|
+| `skill.name` | `"ask"` |
+| `skill.input` | `"what is jaeger?"` |
+| `skill.llm_response` | `"Jaeger is an open-source..."` |
+| `skill.answer_source` | `"knowledge_base"` / `"fallback"` |
+| `skill.duration_ms` | `0.007` |
+| `skill.status` | `"ok"` / `"error"` |
+
+### Direct curl spans (`health-check`)
+
+| Attribute | Spans | Example |
+|---|---|---|
+| `skill.name` | all | `"health-check"` |
+| `skill.step` | all | `"cpu"`, `"memory"`, `"disk"`, `"summary"` |
+| `skill.input` | all | `"/health-check"` |
+| `skill.triggered_by` | all | `"claude"` |
+| `system.cpu_usage` | cpu | `"9.11%"` |
+| `system.memory_free_pages` | memory | `"3922"` |
+| `system.disk_used_percent` | disk | `"14%"` |
+| `skill.llm_response` | summary only | `"CPU: 9.11%, Memory: 3922 free pages, Disk: 14% used"` |
+| `skill.result` | summary only | `"all-checks-complete"` |
 
 ---
 
-## Jaeger fallback — view spans offline
+## Onboarding a new skill
 
-When Jaeger is unreachable, spans are written to `telemetry_spans.json` automatically.  
-View them with:
+Follow these steps to add a new skill to the project.
+
+### Step 1 — Create the skill folder
 
 ```bash
-python view_spans.py                   # all spans
-python view_spans.py --skill ask       # filter by skill name
-python view_spans.py --status error    # only errors
-python view_spans.py --tail 10         # last 10 spans
+mkdir .claude/skills/myskill
 ```
 
----
+### Step 2 — Choose a telemetry approach
 
-## Adding a new skill
+| Approach | Best for | Dependencies |
+|---|---|---|
+| A — OTel SDK | Rich parent/child traces | `opentelemetry-sdk` (already in requirements.txt) |
+| B — Stdlib HTTP | Simple single span, no SDK | None — pure Python stdlib |
+| C — Direct curl | No Python script needed, multiple spans | None — just `curl` |
 
-### Option A — OTel SDK (greet/joke pattern)
+### Step 3 — Create index.py (Approach A or B only)
 
+**Approach A — OTel SDK:**
 ```python
 # .claude/skills/myskill/index.py
 from __future__ import annotations
@@ -228,10 +256,10 @@ from hooks.otel_skill_tracer import trace_skill, trace_skill_read
 
 _SKILL_MD = Path(__file__).parent / "SKILL.md"
 
-def run_myskill_skill(triggered_by: str, context: dict) -> dict[str, str]:
+def run_myskill_skill(triggered_by: str) -> dict[str, str]:
     def _execute() -> dict[str, str]:
         trace_skill_read("myskill", str(_SKILL_MD), "", triggered=True)
-        return {"skill": "myskill", "message": "Hello from myskill"}
+        return {"skill": "myskill", "message": "Hello from myskill!"}
 
     return trace_skill(
         skill_name="myskill",
@@ -246,20 +274,23 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--triggered-by", default="cli")
     args = parser.parse_args()
-    print(json.dumps(run_myskill_skill(args.triggered_by, {})))
+    print(json.dumps(run_myskill_skill(args.triggered_by)))
 ```
 
-### Option B — Stdlib HTTP (ask pattern)
-
+**Approach B — Stdlib HTTP:**
 ```python
-# .claude/skills/myskill/index.py — no OTel SDK needed
+# .claude/skills/myskill/index.py
+from __future__ import annotations
 import time, json, argparse
 
-def run_myskill_skill(arg: str) -> dict:
+def run_myskill_skill(arg: str) -> dict[str, str | float]:
     start = time.time()
-    result = {"skill": "myskill", "message": f"Result for {arg}",
-              "model": "rule-based", "duration_ms": round((time.time()-start)*1000, 3)}
-    return result
+    return {
+        "skill":       "myskill",
+        "message":     f"Result for {arg}",
+        "model":       "rule-based",
+        "duration_ms": round((time.time() - start) * 1000, 3),
+    }
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -268,11 +299,121 @@ if __name__ == "__main__":
     print(json.dumps(run_myskill_skill(args.arg)))
 ```
 
-SKILL.md instructions for Option B:
+### Step 4 — Create SKILL.md
+
+**Approach A — OTel SDK:**
 ```markdown
-1. Run: `python3 .claude/skills/myskill/index.py --arg <value> --triggered-by claude | tail -1`
-2. Run: `python3 hooks/send_span.py --skill myskill --input "<value>" --skill-output '<json from step 1>' --triggered-by claude --status ok`
-3. Return the message to the user.
+---
+name: myskill
+description: What this skill does. Use when user says myskill <arg>.
+argument-hint: <arg>
+user-invocable: true
+---
+
+## Instructions
+
+Run: `python3 .claude/skills/myskill/index.py --triggered-by claude`
+
+Return the `message` field from the JSON output to the user.
+```
+
+**Approach B — Stdlib HTTP:**
+```markdown
+---
+name: myskill
+description: What this skill does. Use when user says myskill <arg>.
+argument-hint: <arg>
+user-invocable: true
+---
+
+## Instructions
+
+1. Run the skill:
+   `python3 .claude/skills/myskill/index.py --arg "<arg>" --triggered-by claude | tail -1`
+
+2. Send telemetry:
+   `python3 hooks/send_span.py --skill myskill --input "<arg>" --skill-output '<json from step 1>' --triggered-by claude --status ok`
+
+3. Return the `message` field to the user.
+```
+
+**Approach C — Direct curl:**
+```markdown
+---
+name: myskill
+description: What this skill does. Use when user says myskill.
+argument-hint: (no arguments)
+user-invocable: true
+---
+
+## Instructions
+
+Replace `<USER_PROMPT>` with the exact message the user typed, then run:
+
+```bash
+TRACE_ID=$(python3 -c "import os; print(os.urandom(16).hex())")
+ENDPOINT="http://localhost:4318/v1/traces"
+USER_PROMPT="<USER_PROMPT>"
+
+send_span() {
+  local SPAN_NAME="$1" STEP="$2" ATTR_KEY="$3" ATTR_VAL="$4"
+  local SPAN_ID TS PAYLOAD
+  SPAN_ID=$(python3 -c "import os; print(os.urandom(8).hex())")
+  TS=$(python3 -c "import time; print(time.time_ns())")
+  PAYLOAD=$(python3 - <<PYEOF
+import json
+print(json.dumps({"resourceSpans":[{"resource":{"attributes":[{"key":"service.name","value":{"stringValue":"claude-skills"}}]},"scopeSpans":[{"scope":{"name":"myskill"},"spans":[{"traceId":"$TRACE_ID","spanId":"$SPAN_ID","name":"$SPAN_NAME","kind":1,"startTimeUnixNano":"$TS","endTimeUnixNano":"$TS","attributes":[{"key":"skill.name","value":{"stringValue":"myskill"}},{"key":"skill.step","value":{"stringValue":"$STEP"}},{"key":"skill.input","value":{"stringValue":"$USER_PROMPT"}},{"key":"$ATTR_KEY","value":{"stringValue":"$ATTR_VAL"}}],"status":{"code":1}}]}]}]}))
+PYEOF
+)
+  curl -s -o /dev/null -w "  curl POST [$SPAN_NAME]: HTTP %{http_code}\n" \
+    -X POST "$ENDPOINT" -H "Content-Type: application/json" -d "$PAYLOAD"
+}
+
+send_span "myskill.start" "start" "skill.triggered_by" "claude"
+# ... add more steps as needed
+```
+```
+
+### Step 5 — Test locally
+
+```bash
+# Direct CLI test (Approach A or B)
+python3 .claude/skills/myskill/index.py --triggered-by cli
+
+# Test via Claude Code
+claude
+# type: myskill <arg>
+```
+
+### Step 6 — Verify in Jaeger
+
+```
+http://localhost:16686
+→ Service: claude-skills
+→ Operation: skill.myskill (or myskill.*)
+→ Find Traces
+```
+
+### Step 7 — Commit and push
+
+```bash
+git add .claude/skills/myskill/
+git commit -m "feat: add myskill with <approach> telemetry"
+git push origin main
+```
+
+---
+
+## Jaeger fallback — view spans offline
+
+When Jaeger is unreachable, `send_span.py` spans are written to `telemetry_spans.json` automatically.  
+*(Note: direct curl spans from `health-check` are not saved to file when Jaeger is unreachable.)*
+
+```bash
+python view_spans.py                   # all spans
+python view_spans.py --skill ask       # filter by skill name
+python view_spans.py --status error    # only errors
+python view_spans.py --tail 10         # last 10 spans
 ```
 
 ---
@@ -281,7 +422,7 @@ SKILL.md instructions for Option B:
 
 | Variable | Default | Description |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` (OTel SDK) / `http://localhost:4318` (send_span.py) | OTLP endpoint for Jaeger |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` (OTel SDK) / `http://localhost:4318` (send_span.py + curl) | OTLP endpoint for Jaeger |
 
 ---
 
@@ -293,20 +434,22 @@ SKILL.md instructions for Option B:
 │   ├── settings.json
 │   └── skills/
 │       ├── greet/
-│       │   ├── SKILL.md          # argument-hint, user-invocable, run instruction
-│       │   └── index.py          # OTel SDK tracing via otel_skill_tracer.py
+│       │   ├── SKILL.md          # OTel SDK — 2 spans (parent + child)
+│       │   └── index.py
 │       ├── joke/
-│       │   ├── SKILL.md
-│       │   └── index.py          # OTel SDK tracing via otel_skill_tracer.py
-│       └── ask/
-│           ├── SKILL.md          # 2-step: run index.py then send_span.py
-│           └── index.py          # returns JSON with llm_response + metadata
+│       │   ├── SKILL.md          # OTel SDK — 2 spans (parent + child)
+│       │   └── index.py
+│       ├── ask/
+│       │   ├── SKILL.md          # Stdlib HTTP — 1 span via send_span.py
+│       │   └── index.py
+│       └── health-check/
+│           └── SKILL.md          # Direct curl — 5 spans, cross-platform (macOS/Linux/Windows)
 ├── hooks/
-│   ├── otel_skill_tracer.py      # OTel SDK — singleton TracerProvider, trace_skill, trace_skill_read
-│   └── send_span.py              # Stdlib HTTP — no SDK, posts OTLP JSON to Jaeger port 4318
-├── test_spans.py                 # exercises all span types (greet, joke, ask, error)
-├── view_spans.py                 # offline span viewer for telemetry_spans.json
-├── telemetry_spans.json          # auto-created when Jaeger is unreachable
+│   ├── otel_skill_tracer.py      # OTel SDK tracer (greet, joke)
+│   └── send_span.py              # Stdlib OTLP HTTP sender (ask)
+├── test_spans.py                 # Exercises all span types
+├── view_spans.py                 # Offline span viewer for telemetry_spans.json
+├── telemetry_spans.json          # Auto-created when Jaeger is unreachable
 ├── docker-compose.yml            # Jaeger all-in-one (ports 16686, 4317, 4318)
 ├── requirements.txt
 └── README.md
